@@ -9,6 +9,7 @@ from httpx import ASGITransport, AsyncClient
 
 from llm_guard.analyzers.verification import VerificationAnalyzer
 from llm_guard.config import VerificationConfig
+from llm_guard.utils.consistency import compute_consistency
 
 
 def create_verification_mock(response_content: str = "") -> FastAPI:
@@ -180,12 +181,11 @@ def test_internal_header():
     assert analyzer.config.enabled is True
 
 
-# --- Consistency computation ---
+# --- Consistency computation (now in utils.consistency, tested in test_consistency.py) ---
+
 
 def test_consistency_high():
-    config = VerificationConfig(enabled=True)
-    analyzer = VerificationAnalyzer(config=config, upstream_base_url="http://mock")
-    result = analyzer._compute_consistency(
+    result = compute_consistency(
         "The sky is blue and water is wet",
         ["The sky is blue and water is wet", "The sky is blue and water is wet"],
     )
@@ -194,9 +194,7 @@ def test_consistency_high():
 
 
 def test_consistency_low():
-    config = VerificationConfig(enabled=True)
-    analyzer = VerificationAnalyzer(config=config, upstream_base_url="http://mock")
-    result = analyzer._compute_consistency(
+    result = compute_consistency(
         "The sky is blue",
         ["Bananas are yellow fruit from tropical regions", "Cats sleep eighteen hours daily on average"],
     )

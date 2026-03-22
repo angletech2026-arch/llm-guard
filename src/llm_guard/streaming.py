@@ -54,7 +54,7 @@ async def stream_and_analyze(
                             except Exception as e:
                                 logger.error("Stream analyzer %s failed: %s", type(analyzer).__name__, e)
 
-                        if results:
+                        if results and config.output.streaming_analysis == "sse_chunk":
                             chunk = build_analysis_sse_chunk(results)
                             yield chunk.encode("utf-8")
 

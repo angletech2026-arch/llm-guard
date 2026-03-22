@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -26,6 +27,9 @@ FORWARDED_HEADERS = {
     "user-agent",
 }
 
+# Analyzers that only need request data (can run before upstream responds)
+PRE_RESPONSE_TYPES = (ConflictAnalyzer,)
+
 
 class ProxyHandler:
     def __init__(self, config: GuardConfig) -> None:
@@ -41,26 +45,39 @@ class ProxyHandler:
             limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
         )
 
+        up = self.config.upstream
         if self.config.analyzers.confidence.enabled:
-            self.analyzers.append(ConfidenceAnalyzer(self.config.analyzers.confidence))
+            self.analyzers.append(ConfidenceAnalyzer(
+                config=self.config.analyzers.confidence,
+                upstream_base_url=up.base_url,
+                upstream_api_key=up.api_key,
+                upstream_timeout=up.timeout,
+                verify_ssl=up.verify_ssl,
+            ))
 
         if self.config.analyzers.conflict.enabled:
-            self.analyzers.append(ConflictAnalyzer(self.config.analyzers.conflict))
+            self.analyzers.append(ConflictAnalyzer(
+                config=self.config.analyzers.conflict,
+                upstream_base_url=up.base_url,
+                upstream_api_key=up.api_key,
+                upstream_timeout=up.timeout,
+                verify_ssl=up.verify_ssl,
+            ))
 
         if self.config.analyzers.verification.enabled:
             self.analyzers.append(VerificationAnalyzer(
                 config=self.config.analyzers.verification,
-                upstream_base_url=self.config.upstream.base_url,
-                upstream_api_key=self.config.upstream.api_key,
-                upstream_timeout=self.config.upstream.timeout,
-                verify_ssl=self.config.upstream.verify_ssl,
+                upstream_base_url=up.base_url,
+                upstream_api_key=up.api_key,
+                upstream_timeout=up.timeout,
+                verify_ssl=up.verify_ssl,
             ))
 
     async def shutdown(self) -> None:
         if self.client:
             await self.client.aclose()
         for analyzer in self.analyzers:
-            if isinstance(analyzer, VerificationAnalyzer):
+            if hasattr(analyzer, "close"):
                 await analyzer.close()
 
     def _build_headers(self, request: Request) -> dict[str, str]:
@@ -75,13 +92,11 @@ class ProxyHandler:
         return headers
 
     def _is_internal(self, request: Request) -> bool:
-        """Check if this is an internal request from verification analyzer."""
         return request.headers.get("x-llm-guard-internal") == "true"
 
     async def handle(self, request: Request, path: str) -> JSONResponse | StreamingResponse:
         assert self.client is not None
 
-        # Skip analysis for internal requests (prevents recursion)
         if self._is_internal(request):
             logger.debug("Internal request, passthrough: %s", path)
             headers = self._build_headers(request)
@@ -101,7 +116,6 @@ class ProxyHandler:
                 request_data = json.loads(body)
                 is_streaming = request_data.get("stream", False)
 
-                # Enrich request (inject logprobs)
                 request_data, logprobs_injected = enrich_request(request_data, self.config)
                 body = json.dumps(request_data).encode("utf-8")
             except (json.JSONDecodeError, UnicodeDecodeError):
@@ -133,23 +147,39 @@ class ProxyHandler:
                 content={"error": {"message": f"Upstream timeout: {e}", "type": "proxy_error"}},
             )
 
-    async def _run_analyzers(
+    async def _run_pre_analyzers(
+        self, request_data: dict[str, Any] | None
+    ) -> list[AnalyzerResult]:
+        """Run analyzers that only need request data (conflict detection)."""
+        results: list[AnalyzerResult] = []
+        messages = (request_data or {}).get("messages", [])
+        for analyzer in self.analyzers:
+            if isinstance(analyzer, PRE_RESPONSE_TYPES):
+                try:
+                    result = await analyzer.analyze(messages, "", None)
+                    if result is not None:
+                        results.append(result)
+                except Exception as e:
+                    logger.error("Pre-analyzer %s failed: %s", type(analyzer).__name__, e)
+        return results
+
+    async def _run_post_analyzers(
         self,
         request_data: dict[str, Any] | None,
         response_text: str,
         logprobs: list[dict[str, Any]] | None,
     ) -> list[AnalyzerResult]:
+        """Run analyzers that need the response (confidence, verification)."""
         results: list[AnalyzerResult] = []
         messages = (request_data or {}).get("messages", [])
-
         for analyzer in self.analyzers:
-            try:
-                result = await analyzer.analyze(messages, response_text, logprobs)
-                if result is not None:
-                    results.append(result)
-            except Exception as e:
-                logger.error("Analyzer %s failed: %s", type(analyzer).__name__, e)
-
+            if not isinstance(analyzer, PRE_RESPONSE_TYPES):
+                try:
+                    result = await analyzer.analyze(messages, response_text, logprobs)
+                    if result is not None:
+                        results.append(result)
+                except Exception as e:
+                    logger.error("Post-analyzer %s failed: %s", type(analyzer).__name__, e)
         return results
 
     async def _handle_normal(
@@ -163,19 +193,41 @@ class ProxyHandler:
     ) -> JSONResponse:
         assert self.client is not None
 
+        # Launch pre-response analyzers in parallel with upstream call
+        pre_task: asyncio.Task[list[AnalyzerResult]] | None = None
+        if request_data is not None:
+            pre_task = asyncio.create_task(self._run_pre_analyzers(request_data))
+
         response = await self.client.request(
-            method=method,
-            url=path,
-            headers=headers,
-            content=body,
+            method=method, url=path, headers=headers, content=body,
         )
+
+        # Retry without logprobs if upstream rejected them
+        if response.status_code == 400 and logprobs_injected and request_data is not None:
+            logger.warning("Upstream rejected logprobs, retrying without")
+            retry_data = dict(request_data)
+            retry_data.pop("logprobs", None)
+            retry_data.pop("top_logprobs", None)
+            retry_body = json.dumps(retry_data).encode("utf-8")
+            response = await self.client.request(
+                method=method, url=path, headers=headers, content=retry_body,
+            )
+            logprobs_injected = False
 
         try:
             data = response.json()
         except (json.JSONDecodeError, ValueError):
             data = {"raw": response.text}
 
-        # Run analyzers on chat completions
+        # Gather pre-response results
+        pre_results: list[AnalyzerResult] = []
+        if pre_task is not None:
+            try:
+                pre_results = await pre_task
+            except Exception as e:
+                logger.error("Pre-analyzer task failed: %s", e)
+
+        # Run post-response analyzers
         if request_data is not None and "choices" in data:
             response_text = ""
             logprobs_data = None
@@ -188,10 +240,12 @@ class ProxyHandler:
             if lp and "content" in lp:
                 logprobs_data = lp["content"]
 
-            results = await self._run_analyzers(request_data, response_text, logprobs_data)
+            post_results = await self._run_post_analyzers(request_data, response_text, logprobs_data)
+            all_results = pre_results + post_results
 
-            if results:
-                data = enrich_response(data, results, self.config, logprobs_injected)
+            if all_results:
+                data, extra_headers = enrich_response(data, all_results, self.config, logprobs_injected)
+                return JSONResponse(status_code=response.status_code, content=data, headers=extra_headers)
 
         return JSONResponse(status_code=response.status_code, content=data)
 
@@ -207,10 +261,7 @@ class ProxyHandler:
         assert self.client is not None
 
         req = self.client.build_request(
-            method=method,
-            url=path,
-            headers=headers,
-            content=body,
+            method=method, url=path, headers=headers, content=body,
         )
         upstream_response = await self.client.send(req, stream=True)
 

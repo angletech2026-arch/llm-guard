@@ -3,8 +3,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from llm_guard.analyzers.base import AnalyzerResult, BaseAnalyzer
+from llm_guard.analyzers.base import AnalyzerResult, BaseAnalyzer, LLMClientMixin
 from llm_guard.config import ConfidenceConfig
+from llm_guard.utils.consistency import compute_consistency
 from llm_guard.utils.logprobs_math import (
     aggregate_scores,
     classify,
@@ -16,9 +17,17 @@ from llm_guard.utils.text_patterns import split_sentences
 logger = logging.getLogger("llm_guard")
 
 
-class ConfidenceAnalyzer(BaseAnalyzer):
-    def __init__(self, config: ConfidenceConfig) -> None:
+class ConfidenceAnalyzer(BaseAnalyzer, LLMClientMixin):
+    def __init__(
+        self,
+        config: ConfidenceConfig,
+        upstream_base_url: str = "",
+        upstream_api_key: str = "",
+        upstream_timeout: int = 120,
+        verify_ssl: bool = True,
+    ) -> None:
         self.config = config
+        self._init_llm_client(upstream_base_url, upstream_api_key, upstream_timeout, verify_ssl)
 
     async def analyze(
         self,
@@ -30,34 +39,33 @@ class ConfidenceAnalyzer(BaseAnalyzer):
             return None
 
         if logprobs is None or len(logprobs) == 0:
+            # Fallback: multi-sample confidence estimation
+            if self.config.fallback_enabled and self._has_upstream and response_text:
+                return await self._fallback_multi_sample(request_messages, response_text)
             logger.debug("No logprobs available, skipping confidence analysis")
             return None
 
-        # Extract token-level data
+        # Logprobs-based analysis
         tokens = self._extract_tokens(logprobs)
         if not tokens:
             return None
 
-        # Compute per-token confidence
         all_scores = [token_confidence(t["logprob"]) for t in tokens]
-
-        # Overall score
         overall_score = aggregate_scores(all_scores, self.config.aggregate_method)
         overall_level = classify(
             overall_score, self.config.low_threshold, self.config.medium_threshold
         )
 
-        # Find low-confidence segments
         low_segments = find_consecutive_low(
             tokens, self.config.low_threshold, self.config.min_consecutive_low
         )
 
-        # Per-sentence breakdown
         sentences = self._score_sentences(response_text, tokens)
 
         data: dict[str, Any] = {
             "overall": overall_level,
             "overall_score": round(overall_score, 4),
+            "method": "logprobs",
             "low_confidence_segments": [
                 {
                     "text": seg["text"],
@@ -72,8 +80,49 @@ class ConfidenceAnalyzer(BaseAnalyzer):
 
         return AnalyzerResult(analyzer_name="confidence", data=data)
 
+    async def _fallback_multi_sample(
+        self,
+        request_messages: list[dict[str, Any]],
+        response_text: str,
+    ) -> AnalyzerResult | None:
+        """Estimate confidence via multi-sample consistency."""
+        try:
+            samples: list[str] = []
+            for _ in range(self.config.fallback_samples):
+                sample = await self._call_llm_chat(
+                    request_messages,
+                    self.config.fallback_model,
+                    max_tokens=1024,
+                    temperature=self.config.fallback_temperature,
+                )
+                samples.append(sample)
+
+            consistency = compute_consistency(response_text, samples)
+            score = consistency["score"]
+
+            if score > 0.8:
+                level = "HIGH"
+            elif score > 0.5:
+                level = "MEDIUM"
+            else:
+                level = "LOW"
+
+            return AnalyzerResult(
+                analyzer_name="confidence",
+                data={
+                    "overall": level,
+                    "overall_score": score,
+                    "method": "multi_sample_fallback",
+                    "samples": self.config.fallback_samples,
+                    "low_confidence_segments": [],
+                    "sentence_scores": [],
+                },
+            )
+        except Exception as e:
+            logger.error("Confidence fallback failed: %s", e)
+            return None
+
     def _extract_tokens(self, logprobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Extract token/logprob pairs from OpenAI logprobs format."""
         tokens: list[dict[str, Any]] = []
         for entry in logprobs:
             token = entry.get("token", "")
@@ -85,7 +134,6 @@ class ConfidenceAnalyzer(BaseAnalyzer):
     def _score_sentences(
         self, text: str, tokens: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        """Score each sentence by mapping tokens back to sentence boundaries."""
         sentences = split_sentences(text)
         if not sentences:
             return []

@@ -177,12 +177,13 @@ async def test_enrichment_pipeline():
         }],
     }
 
-    # Step 3: Enrich response
+    # Step 3: Enrich response (default mode is "header")
     results = [AnalyzerResult(analyzer_name="confidence", data={"overall": "HIGH", "overall_score": 0.99})]
-    enriched = enrich_response(response, results, config, logprobs_injected=True)
+    enriched, headers = enrich_response(response, results, config, logprobs_injected=True)
 
-    assert "llm_guard" in enriched
-    assert enriched["llm_guard"]["confidence"]["overall"] == "HIGH"
+    # Default header mode: body untouched, headers have data
+    assert "llm_guard" not in enriched
+    assert headers["X-LLM-Guard-Confidence"] == "HIGH"
     # Injected logprobs should be stripped
     assert "logprobs" not in enriched["choices"][0]
 

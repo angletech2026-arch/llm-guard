@@ -28,6 +28,11 @@ class ConfidenceConfig(BaseModel):
     medium_threshold: float = -1.0
     aggregate_method: str = "p10"
     min_consecutive_low: int = 3
+    # Multi-sample fallback when logprobs unavailable
+    fallback_enabled: bool = False
+    fallback_samples: int = 3
+    fallback_temperature: float = 0.8
+    fallback_model: str = "gpt-4o-mini"
 
 
 class ConflictRule(BaseModel):
@@ -42,6 +47,10 @@ class ConflictConfig(BaseModel):
     check_language_conflict: bool = True
     check_instruction_conflict: bool = True
     custom_rules: list[ConflictRule] = Field(default_factory=list)
+    # LLM-based fallback when regex finds nothing
+    llm_fallback_enabled: bool = False
+    llm_fallback_model: str = "gpt-4o-mini"
+    llm_fallback_max_tokens: int = 256
 
 
 class VerificationConfig(BaseModel):
@@ -60,8 +69,9 @@ class AnalyzersConfig(BaseModel):
 
 
 class OutputConfig(BaseModel):
-    mode: str = "metadata"
+    mode: str = "header"  # "header" (default, safest) | "metadata" | "both"
     verbose_confidence: bool = False
+    streaming_analysis: str = "none"  # "none" (default) | "sse_chunk"
 
 
 class GuardConfig(BaseModel):

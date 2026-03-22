@@ -13,6 +13,9 @@ def test_default_config():
     assert config.analyzers.confidence.enabled is True
     assert config.analyzers.conflict.enabled is True
     assert config.analyzers.verification.enabled is False
+    assert config.output.mode == "header"
+    assert config.analyzers.confidence.fallback_enabled is False
+    assert config.analyzers.conflict.llm_fallback_enabled is False
 
 
 def test_load_config_no_file():

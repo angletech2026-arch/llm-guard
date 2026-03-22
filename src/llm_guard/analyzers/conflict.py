@@ -4,14 +4,13 @@ import logging
 import re
 from typing import Any
 
-from llm_guard.analyzers.base import AnalyzerResult, BaseAnalyzer
+from llm_guard.analyzers.base import AnalyzerResult, BaseAnalyzer, LLMClientMixin
 from llm_guard.config import ConflictConfig
 from llm_guard.utils.text_patterns import detect_arabic, detect_cjk, detect_cyrillic
 
 logger = logging.getLogger("llm_guard")
 
 # Contradictory instruction pattern pairs
-# Each tuple: (pattern_a, pattern_b, description)
 INSTRUCTION_CONFLICT_PATTERNS: list[tuple[str, str, str]] = [
     # Language conflicts
     (r"(?:respond|reply|answer|write)\s+(?:in\s+)?english", r"(?:respond|reply|answer|write)\s+(?:in\s+)?chinese", "Language: English vs Chinese"),
@@ -35,10 +34,30 @@ INSTRUCTION_CONFLICT_PATTERNS: list[tuple[str, str, str]] = [
     (r"\b(?:never|don'?t|do\s+not)\s+(?:use|include|add)\b", r"\b(?:always|must|should)\s+(?:use|include|add)\b", "Directive: never use vs always use"),
 ]
 
+CONFLICT_LLM_PROMPT = """Analyze these messages for conflicting instructions between different roles.
 
-class ConflictAnalyzer(BaseAnalyzer):
-    def __init__(self, config: ConflictConfig) -> None:
+Messages:
+{messages_text}
+
+Are there contradictory or conflicting instructions between the system and user messages?
+Look for conflicts in: language, tone, verbosity, format, allowed/forbidden actions.
+
+Respond in this exact JSON format:
+{{"conflicts": [{{"type": "instruction_conflict", "severity": "HIGH", "message": "description of conflict", "sources": ["system", "user"]}}]}}
+If no conflicts found, respond: {{"conflicts": []}}"""
+
+
+class ConflictAnalyzer(BaseAnalyzer, LLMClientMixin):
+    def __init__(
+        self,
+        config: ConflictConfig,
+        upstream_base_url: str = "",
+        upstream_api_key: str = "",
+        upstream_timeout: int = 120,
+        verify_ssl: bool = True,
+    ) -> None:
         self.config = config
+        self._init_llm_client(upstream_base_url, upstream_api_key, upstream_timeout, verify_ssl)
 
     async def analyze(
         self,
@@ -62,20 +81,56 @@ class ConflictAnalyzer(BaseAnalyzer):
 
         conflicts.extend(self._check_custom_rules(request_messages))
 
+        # LLM fallback when regex finds nothing
+        if not conflicts and self.config.llm_fallback_enabled and self._has_upstream:
+            llm_conflicts = await self._llm_conflict_check(request_messages)
+            conflicts.extend(llm_conflicts)
+
         if not conflicts:
             return None
 
         return AnalyzerResult(analyzer_name="conflicts", data={"items": conflicts})
 
+    async def _llm_conflict_check(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Use LLM to detect conflicts that regex missed."""
+        try:
+            messages_text = "\n".join(
+                f"[{msg.get('role', 'user')}]: {msg.get('content', '')}"
+                for msg in messages
+                if isinstance(msg.get("content"), str)
+            )
+            prompt = CONFLICT_LLM_PROMPT.format(messages_text=messages_text)
+            text = await self._call_llm(
+                prompt, self.config.llm_fallback_model, self.config.llm_fallback_max_tokens
+            )
+            data = self._parse_json_response(text)
+            raw_conflicts = data.get("conflicts", [])
+
+            result: list[dict[str, Any]] = []
+            for c in raw_conflicts:
+                if isinstance(c, dict) and c.get("message"):
+                    result.append({
+                        "type": c.get("type", "instruction_conflict"),
+                        "severity": c.get("severity", "MEDIUM"),
+                        "message": c["message"],
+                        "sources": c.get("sources", ["system", "user"]),
+                        "resolution": f"Following {self.config.priority[0]} (highest priority)",
+                        "method": "llm_fallback",
+                    })
+            return result
+        except Exception as e:
+            logger.error("LLM conflict check failed: %s", e)
+            return []
+
     def _get_priority(self, role: str) -> int:
-        """Lower number = higher priority."""
         try:
             return self.config.priority.index(role)
         except ValueError:
             return len(self.config.priority)
 
     def _resolve(self, role_a: str, role_b: str) -> str:
-        """Return which role wins based on priority config."""
         if self._get_priority(role_a) <= self._get_priority(role_b):
             return role_a
         return role_b
@@ -83,22 +138,19 @@ class ConflictAnalyzer(BaseAnalyzer):
     def _check_language_conflicts(
         self, messages: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        """Detect language mismatches between messages of different roles."""
         conflicts: list[dict[str, Any]] = []
 
         role_languages: dict[str, set[str]] = {}
-        for i, msg in enumerate(messages):
+        for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
             if not isinstance(content, str):
                 continue
-
             langs = self._detect_languages(content)
             if role not in role_languages:
                 role_languages[role] = set()
             role_languages[role].update(langs)
 
-        # Check for explicit language instruction conflicts across roles
         roles = list(role_languages.keys())
         for i in range(len(roles)):
             for j in range(i + 1, len(roles)):
@@ -120,7 +172,6 @@ class ConflictAnalyzer(BaseAnalyzer):
         return conflicts
 
     def _detect_languages(self, text: str) -> set[str]:
-        """Detect which scripts/languages are present in text."""
         langs: set[str] = set()
         if detect_cjk(text):
             langs.add("cjk")
@@ -135,7 +186,6 @@ class ConflictAnalyzer(BaseAnalyzer):
     def _detect_explicit_language(
         self, messages: list[dict[str, Any]], role: str
     ) -> str | None:
-        """Detect if a specific role explicitly requests a language."""
         lang_patterns = {
             "english": r"(?:respond|reply|answer|write|speak)\s+(?:in\s+)?english",
             "chinese": r"(?:(?:respond|reply|answer|write|speak)\s+(?:in\s+)?chinese|用中文|繁體中文|簡體中文)",
@@ -144,27 +194,21 @@ class ConflictAnalyzer(BaseAnalyzer):
             "french": r"(?:respond|reply|answer|write|speak)\s+(?:in\s+)?french",
             "korean": r"(?:(?:respond|reply|answer|write|speak)\s+(?:in\s+)?korean|한국어로)",
         }
-
         for msg in messages:
             if msg.get("role") != role:
                 continue
             content = msg.get("content", "")
             if not isinstance(content, str):
                 continue
-
             for lang, pattern in lang_patterns.items():
                 if re.search(pattern, content, re.IGNORECASE):
                     return lang
-
         return None
 
     def _check_instruction_conflicts(
         self, messages: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        """Check for contradictory instruction patterns across different roles."""
         conflicts: list[dict[str, Any]] = []
-
-        # Group message content by role
         role_content: dict[str, str] = {}
         for msg in messages:
             role = msg.get("role", "user")
@@ -186,20 +230,10 @@ class ConflictAnalyzer(BaseAnalyzer):
 
                     match_a_in_a = re.search(pattern_a, text_a, re.IGNORECASE)
                     match_b_in_b = re.search(pattern_b, text_b, re.IGNORECASE)
-
                     match_b_in_a = re.search(pattern_b, text_a, re.IGNORECASE)
                     match_a_in_b = re.search(pattern_a, text_b, re.IGNORECASE)
 
-                    if match_a_in_a and match_b_in_b:
-                        winner = self._resolve(role_a, role_b)
-                        conflicts.append({
-                            "type": "instruction_conflict",
-                            "severity": "MEDIUM",
-                            "message": f"{description} — {role_a} vs {role_b}",
-                            "sources": [role_a, role_b],
-                            "resolution": f"Following {winner} (higher priority)",
-                        })
-                    elif match_b_in_a and match_a_in_b:
+                    if (match_a_in_a and match_b_in_b) or (match_b_in_a and match_a_in_b):
                         winner = self._resolve(role_a, role_b)
                         conflicts.append({
                             "type": "instruction_conflict",
@@ -214,26 +248,21 @@ class ConflictAnalyzer(BaseAnalyzer):
     def _check_custom_rules(
         self, messages: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        """Check user-defined custom conflict rules."""
         conflicts: list[dict[str, Any]] = []
-
         all_text = " ".join(
             msg.get("content", "")
             for msg in messages
             if isinstance(msg.get("content"), str)
         )
-
         for rule in self.config.custom_rules:
             match_a = re.search(rule.pattern_a, all_text, re.IGNORECASE)
             match_b = re.search(rule.pattern_b, all_text, re.IGNORECASE)
-
             if match_a and match_b:
                 conflicts.append({
                     "type": "custom_conflict",
                     "severity": "MEDIUM",
-                    "message": rule.message or f"Custom rule conflict: '{rule.pattern_a}' vs '{rule.pattern_b}'",
+                    "message": rule.message or f"Custom rule: '{rule.pattern_a}' vs '{rule.pattern_b}'",
                     "sources": ["custom_rule"],
                     "resolution": "User-defined rule triggered",
                 })
-
         return conflicts

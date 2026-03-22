@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import pytest
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse as FastJSONResponse
+from httpx import ASGITransport, AsyncClient
 
 from llm_guard.analyzers.confidence import ConfidenceAnalyzer
 from llm_guard.config import ConfidenceConfig
@@ -96,3 +99,82 @@ async def test_disabled():
         logprobs=[{"token": "Hello", "logprob": -0.1}],
     )
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_logprobs_method_field(analyzer, high_confidence_logprobs):
+    """Logprobs-based analysis includes method='logprobs'."""
+    result = await analyzer.analyze(
+        request_messages=[{"role": "user", "content": "Hi"}],
+        response_text="Hello! How can I help?",
+        logprobs=high_confidence_logprobs,
+    )
+    assert result is not None
+    assert result.data["method"] == "logprobs"
+
+
+# --- Fallback tests ---
+
+
+def _make_chat_mock(content: str = "Paris is the capital of France.") -> FastAPI:
+    mock = FastAPI()
+
+    @mock.post("/v1/chat/completions")
+    async def completions(request: Request) -> FastJSONResponse:
+        return FastJSONResponse(content={
+            "choices": [{
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }],
+        })
+
+    return mock
+
+
+@pytest.mark.asyncio
+async def test_fallback_disabled_returns_none():
+    """Fallback disabled + no logprobs -> None."""
+    config = ConfidenceConfig(fallback_enabled=False)
+    analyzer = ConfidenceAnalyzer(config)
+    result = await analyzer.analyze(
+        request_messages=[{"role": "user", "content": "Hi"}],
+        response_text="Hello there!",
+        logprobs=None,
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_fallback_high_consistency():
+    """All samples return same text -> HIGH confidence."""
+    mock = _make_chat_mock("Paris is the capital of France.")
+    transport = ASGITransport(app=mock)
+
+    config = ConfidenceConfig(fallback_enabled=True, fallback_samples=3)
+    analyzer = ConfidenceAnalyzer(config=config, upstream_base_url="http://mock")
+    analyzer._client = AsyncClient(transport=transport, base_url="http://mock")
+
+    result = await analyzer.analyze(
+        request_messages=[{"role": "user", "content": "What is the capital of France?"}],
+        response_text="Paris is the capital of France.",
+        logprobs=None,
+    )
+    assert result is not None
+    assert result.data["method"] == "multi_sample_fallback"
+    assert result.data["overall"] == "HIGH"
+    assert result.data["overall_score"] == 1.0
+    await analyzer.close()
+
+
+@pytest.mark.asyncio
+async def test_fallback_not_used_when_logprobs_present():
+    """Fallback not called when logprobs are provided."""
+    config = ConfidenceConfig(fallback_enabled=True)
+    analyzer = ConfidenceAnalyzer(config)
+    result = await analyzer.analyze(
+        request_messages=[{"role": "user", "content": "Hi"}],
+        response_text="Hello",
+        logprobs=[{"token": "Hello", "logprob": -0.1}],
+    )
+    assert result is not None
+    assert result.data["method"] == "logprobs"
