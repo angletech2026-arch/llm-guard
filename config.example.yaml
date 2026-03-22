@@ -1,0 +1,39 @@
+# LLM-Guard Configuration
+
+server:
+  host: "127.0.0.1"
+  port: 8400
+  log_level: "info"
+
+upstream:
+  base_url: "https://api.openai.com"
+  api_key: ""
+  timeout: 120
+  verify_ssl: true
+
+analyzers:
+  confidence:
+    enabled: true
+    low_threshold: -3.0
+    medium_threshold: -1.0
+    aggregate_method: "p10"
+    min_consecutive_low: 3
+
+  conflict:
+    enabled: true
+    priority: ["system", "user", "context"]
+    check_language_conflict: true
+    check_instruction_conflict: true
+    custom_rules: []
+
+  verification:
+    enabled: false
+    model: "gpt-4o-mini"
+    mode: "self_check"
+    samples: 3
+    max_tokens: 1024
+    min_response_length: 200
+
+output:
+  mode: "metadata"
+  verbose_confidence: false
