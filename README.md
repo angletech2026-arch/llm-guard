@@ -1,6 +1,6 @@
 # LLM-Guard
 
-[![CI](https://github.com/YOUR_USERNAME/llm-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/YOUR_USERNAME/llm-guard/actions)
+[![CI](https://github.com/angletech2026-arch/llm-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/angletech2026-arch/llm-guard/actions)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 

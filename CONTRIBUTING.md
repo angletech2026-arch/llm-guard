@@ -3,7 +3,7 @@
 ## Setup
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/llm-guard.git
+git clone https://github.com/angletech2026-arch/llm-guard.git
 cd llm-guard
 pip install -e ".[dev]"
 ```
